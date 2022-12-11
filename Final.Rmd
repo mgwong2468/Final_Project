@@ -1,0 +1,811 @@
+---
+title: "Predicting The Number of Individuals who Receive SNAP Assistance Across the Country"
+author: "Mason Wong"
+date: "UCSB Fall 2022"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: "hide"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+![(“Basic Needs Resources”)](C:/Users/Mason Wong/Desktop/Final Project/Final_Project/Images/SNAP.png)
+
+# Introduction
+
+The aim of this project is to build a model using machine learning that is capable of predicting the number of people in a county that receive aid from SNAP. I will be utilizing a multitude of techniques to create the most accurate model for this problem. In particular I will be looking at how variables like the poverty line and urbanization affect an area's utilization of SNAP (Supplemental Nutrition Assistance Program). Using data from usda.gov I am looking to explore the relationship between these variables and use the best possible model to predict the number of SNAP users in a coming year.
+
+## What is Food Insecurity and SNAP 
+
+![(“How Food Insecurity Affects Older Adults”)](C:/Users/Mason Wong/Desktop/Final Project/Final_Project/Images/food_insecurity.png)
+
+Food insecurity is defined as the state in which there is a severe lack of nutritious food that is readily available and affordable. Many regions all over the world have populations that face food insecurity due to having insufficient sources of food, like a lack of supermarkets, or having high poverty rates.
+
+SNAP aims to help combat the affordability issue by providing individuals with funds each month that they can spend on ingredients for their household. But with the ever-growing US population, the USDA has to be careful with how much money they allocate to each individual, especially with new homes constantly being built across the nation.
+
+Here is an additional video that briefly summarizes the purpose and benefits of SNAP:
+```{r}
+# Package for video embedding
+library(vembedr)
+# Embed youtube video
+embed_youtube("dNYUHUHKXtU")
+```
+
+
+## How Can This Model Be Used?
+
+The USDA adjusts its monthly funding each year based on how much money they have available, the current amount of SNAP users, and the expected number of new SNAP users that will join during the year. Using this model can help the USDA calculate the expected number of SNAP users in a state through the usage of population data. Doing so would help the USDA properly manage its funds while also giving them the best opportunity to maximize the amount of money that each individual can receive. 
+
+## Loading The Neccessities
+
+This project uses a data set provided by the [USDA](https://www.ers.usda.gov/data-products/food-access-research-atlas/download-the-data/). The data set was created using info from the 2010 Census to track multiple food access indicators. In total there are 72,500 observations and almost 150 different variables including:  
+- `State`: The State that the data originated from  
+- `Urban`: Whether the Census Tract is Urban or Not  
+- `POP2010`: The recorded population of the tract in 2010  
+- `PovertyRate`: The Poverty Rate of that Census Tract  
+- `MedianFamilyIncome`: The Median Family Income of that Census Tract  
+- And a plethora of variables that keep track of other circumstances: owning a car, distance from a supermarket, etc.   
+
+All of these variables and their definitions can be found within the codebook included with this project.
+
+**Note: A Tract is a region in which the census data was pulled from. A county contains multiple tracts**
+```{r warning = FALSE, message = FALSE}
+# Load ackages
+library(tidymodels)
+library(tidyverse)
+library(tune)
+library(ranger)
+library(corrplot)
+library(xgboost)
+library(ggplot2)
+library(kknn)
+library(readxl)
+library(janitor)
+library(caret)
+library(elasticnet)
+library(dplyr)
+
+# Ensure that our models are consistent by using a seed 
+# Not required since all data is preloaded
+set.seed(100)
+```
+
+```{r warning = FALSE, eval = FALSE, class.source = 'fold-show'}
+# Read in data using readxl package on Sheet 3
+access_main <- read_excel("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/Data/FoodAccessResearchAtlasData2019.xlsx", sheet = 3)
+```
+
+## Data Tidying
+
+This data set is HUGE with many inconsistencies, and thus will need a lot of tidying before I can create an accurate model from it. The steps we will be taking are:  
+- Clean names   
+  - Make variables easier to work with in code  
+```{r eval = FALSE, class.source = 'fold-show'}
+access_clean <- access_main %>%
+  clean_names()
+```
+
+- Remove Variables with excessive NULL values (Over 40%)
+  - Including variables that measured a distance of 10+ or 20+ miles (distance from supermarket)
+- Remove `group_quarters_flag`
+  - Flag is redundant since we already have a numeric variable for group quarters
+- Remove variables targeting a minimum distance of 1/2 a mile
+  - After going through the data, noticed that this data was often a repeat of the total population
+```{r eval = FALSE, class.source = 'fold-show'}
+access_clean <- access_clean %>% select(-("lapop10":"lasnap20share"))
+access_clean <- access_clean %>% select(-(contains("_20")))
+access_clean <- access_clean %>% select(-(contains("_10")))
+access_clean <- access_clean %>% select(-("group_quarters_flag"))
+access_clean <- access_clean %>% select(-(contains("half")))
+```
+![Example of all the Null Values](C:/Users/Mason Wong/Desktop/Final Project/Final_Project/Images/Proof.png)
+- Remove `share` variables:
+  - These variables just record the percentage of the specific target population in the tract
+  - Repetitive because we have the total population and the amount of that demographic already in the data set
+- Remove `census_tract`:
+  - Just an identification number that is unique to each census tract region
+```{r eval = FALSE, class.source = 'fold-show'}
+access_clean <- access_clean %>% select(-(contains("share")))
+access_clean <- access_clean %>% select(-(contains("pctg")))
+access_clean <- access_clean  %>% select(-("census_tract"))
+```
+
+- Remove `lakids1` and `laseniors1`
+  - Kids are unable to apply for SNAP
+  - Seniors are just as eligible as regular adults for SNAP
+```{r eval = FALSE,  class.source = 'fold-show'}
+access_clean <- access_clean %>% select(-(contains("kids")))
+access_clean <- access_clean %>% select(-(contains("senior")))
+```
+
+- Remove `lila_tracts_vehicle`
+- Remove `hunv_flag`
+  - Flags are redundant since we already have a numeric variable for individuals without cars
+- Remove `ohu2010`
+  - Number of households is relatively unimportant to SNAP eligibility, as multiple household members can apply
+```{r eval = FALSE,  class.source = 'fold-show'}
+access_clean <- access_clean %>% select(-(contains("vehicle")))
+access_clean <- access_clean %>% select(-(contains("hunv")))
+access_clean <- access_clean %>% select(-("ohu2010"))
+```
+
+- Remove `county`: 
+ - The values in County are not repetitive enough for usage in resampling
+ - Understood this after atempting to tune models in earlier stages of the project
+- Remove the final few tract variables 
+  - These provide the total number of individuals from different demographics who live in the area
+  - Race is not a deciding factor of SNAP
+  
+*Note: I left the ethnic population 1+ miles away from a supermarket as I thought that this held more of an impact than the total population*
+```{r eval = FALSE,  class.source = 'fold-show'}
+access_clean <- access_clean %>% select(-("county"))
+access_clean <- access_clean %>% select(-("tract_lowi":"tract_hispanic"))
+```
+
+- Correct the `numeric` variables that were read as `characters`
+```{r warning = FALSE, eval = FALSE, class.source = 'fold-show'}
+access_clean[,c(2:25)] <- lapply(access_clean[,c(2:25)], as.double)
+```
+
+- Change flags (1 and 0) to Yes or No for readability
+- Convert these variables into factors
+```{r eval = FALSE, class.source = 'fold-show'}
+# One big mutate function to change flag variables to "Yes" and "No"
+access_clean <- access_clean %>%
+  mutate(urban = case_when(urban == 1 ~ "Yes",
+                           urban == 0 ~ "No"),
+         lila_tracts_1and10 = case_when(lila_tracts_1and10 == 1 ~ "Yes",
+                                        lila_tracts_1and10 == 0 ~ "No"),
+         lila_tracts_1and20 = case_when(lila_tracts_1and20 == 1 ~ "Yes",
+                                        lila_tracts_1and20 == 0 ~ "No"),
+         low_income_tracts = case_when(low_income_tracts == 1 ~ "Yes",
+                                       low_income_tracts == 0 ~ "No"),
+         la1and10 = case_when(la1and10 == 1 ~ "Yes",
+                              la1and10 == 0 ~ "No"),
+         la1and20 = case_when(la1and20 == 1 ~ "Yes",
+                              la1and20 == 0 ~ "No"),
+         la_tracts1 = case_when(la_tracts1 == 1 ~ "Yes",
+                                la_tracts1 == 0 ~ "No"),
+         la_tracts10 = case_when(la_tracts10 == 1 ~ "Yes",
+                                 la_tracts10 == 0 ~ "No"),
+         la_tracts20 = case_when(la_tracts20 == 1 ~ "Yes",
+                                 la_tracts20 == 0 ~ "No"),)
+
+# Convert to factors
+access_clean[,c(1,2,5:7,10:14)] <- lapply(access_clean[,c(1,2,5:7,10:14)], as.factor)
+```
+
+- Remove any remaining observations with Null values to avoid the possibility of bias modeling (20,500 observations)
+  - Might be counter intuitive but I found that my model ran better this way (Attempted a model with and without prior to finalizing this report)
+- Save this data so that loading and cleaning won't be required in the future
+```{r eval = FALSE,  class.source = 'fold-show'}
+access_clean <- access_clean %>%
+  na.omit()
+
+# Save for convenience
+save(access_clean, file = "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/Cleaned_Data.rda")
+```
+
+I removed a lot of variables, but I believe that the ones that were removed were either redundant, or insignificant towards predicting the total amount of SNAP users. After removing all of these variables and observations, I have 52,000 observations left and 25 variables! 
+
+# Exploratory Data Analysis 
+
+For my Exploratory Data Analysis, I analyzed the total 52,000 observations, with each observation referring to a single census tract area.
+```{r}
+# Load pre-existing Tidied Data
+load("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/Cleaned_Data.rda")
+```
+
+I ultimately decided to explore the relationships between `tract_snap` and the other variables in the data set as I wanted to see their relationship with my target variable to get a sense of the direction they may take my predictions.
+
+## Overall SNAP
+
+My first step is plotting my target variable: `tract_snap`
+
+Below is the distribution of the variable
+```{r}
+# Plot the overall distribution of tract_snap
+ggplot(access_clean, aes(tract_snap)) +
+  geom_histogram(bins = 50, color = "grey") +
+  labs(
+    title = "Histogram of tract_snap"
+  )
+```
+
+Using the overall data, the histogram shows that there is a huge right skew, but I can't gather any important information from the distribution alone
+
+## State
+
+My next step is to see if there is any clear relationships between the states and their SNAP user count.
+```{r fig.dim = c(10, 10)}
+# Plot distribution of tract_snap, but organize by State
+ggplot(access_clean, aes(tract_snap)) +
+  geom_histogram(bins = 50, color = "grey") +
+  facet_wrap(~state, scales = "free_y") +
+  labs(
+    title = "Histogram of tract_snap by State",
+    y = "",
+    x = "SNAP Users"
+  )
+```
+
+The graphs seem similar to the cumulative graph, all having a strong right skew. Each of the states seems to follow this pattern to some degree, but some have a small shift to the right or left. Despite this there doesn't seem to be any clear differences
+
+*Note: Upon plotting this, I realized that the data actually includes Washington DC as its separate area, so any future predictions made by this model may be off if this isn't specified.*
+
+## Poverty Rate
+
+My next step is to plot the relationship between `poverty_rate` and `tract_snap`. Again I will sort it by state in case each state acts differently from one another.
+```{r fig.dim = c(10, 10)}
+# Plot tract_snap against poverty_rate and organize by state
+ggplot(access_clean, aes(poverty_rate, tract_snap)) +
+  geom_point(alpha = 0.3) +
+  stat_summary(fun.y=mean, colour = "blue", geom = "line", size = 1) +
+  facet_wrap(~state, scales = "free") +
+  labs(
+    title = "Relationship Between poverty_rate and tract_snap",
+    y = "Snap Count",
+    x = "Poverty Rate"
+  )
+```
+
+Although there are some outliars, it seems that the two variables share a positive relationship. This makes sense, because a state with a higher poverty rate has more people in need of programs like SNAP and thus have more individuals who apply and get into the program. On the other hand, there are some observations in states like Nebraska, New Hampshire, and Maryland that show a SNAP count of 0 at the highest poverty rate. This might mean that there wasn't a recorded value for these areas (incompleted observation?), potentially causing a bias to form within my models.
+
+## Median Family Income
+
+Next was the analyzing `median_family_income` vs `tract_snap`, again by state since the median income levels can heavily vary from state to state.
+```{r fig.dim = c(10, 10)}
+# Plot tract_snap against median_income_level and organize by state
+ggplot(access_clean, aes(median_family_income, tract_snap)) +
+  geom_point(alpha = 0.3) +
+  stat_summary(fun.y=mean, colour = "blue", geom = "line", size = 1) +
+  facet_wrap(~state, scales = "free") +
+  labs(
+    title = "Relationship Between median_income_level and tract_snap",
+    y = "SNAP Count",
+    x = "Median Income Level"
+  )
+```
+
+Here we see the opposite of the `poverty_rate` graph: as SNAP count decreases as the income level rises. This makes sense, since higher income ultimately results in individuals being able to afford more and more commodities, including groceries. For that reason it makes sense that there is a negative relationship here. One thing I did notice was that some areas with higher `median_income_levels` saw higher amounts of SNAP users, and some states like West Virginia and Montana see sudden spikes even though the SNAP count stays constant throughout the rest of the plot. Despite these unique cases, I can safely say that `median_income_level` and `tract_snap` have a relatively negative relationship with one another.
+
+## Population of Urban vs Nonurban Areas
+
+The next variable relationship I will be analyzing is population (`pop2010`) and `tract_snap`. For this data I want to split it into urbanized and nonurbanized communities as I feel that different types of communities have different situations regarding food insecurity. (i.e. cities may have an affordability issue while suburban areas see issues with food deserts.)
+```{r fig.dim = c(10, 10)}
+# Plot pop2010 against poverty_rate and organize by urban
+ggplot(access_clean, aes(pop2010, tract_snap)) +
+  geom_point(alpha = 0.3) +
+  stat_summary(fun.y=mean, colour = "blue", geom = "line", size = 1) +
+  facet_wrap(~urban, scales = "free") +
+  labs(
+    title = "Relationship Between Population Count and tract_snap If Urban",
+    y = "SNAP Count",
+    x = "Population Count"
+  )
+```
+
+In these graphs higher SNAP counts are occuring more in the middle population amounts (7,000 to 15,000). Smaller populations have a understandably lower SNAP count due to there being less individuals who could apply for SNAP. However, larger populations have lower SNAP counts than the middle populations, despite having more individuals present in their community who could apply for SNAP (not necessarily eligible). This is puzzling, because I feel that a higher population would mean more SNAP users as seen in the other population levels. Why could this be?
+
+## Urban?
+
+Because of the last observation, I wanted to see firsthand how urbanization changes the outcome of `tract_snap`
+```{r fig.dim = c(10, 10)}
+# Plot distribution of tract_snap, but organize by State
+ggplot(access_clean, aes(tract_snap)) +
+  geom_histogram(bins = 50, color = "grey") +
+  facet_wrap(~urban, scales = "free_y") +
+  labs(
+    title = "Histogram of tract_snap by State",
+    y = "",
+    x = "SNAP Users"
+  )
+```
+
+It would seem that the distributions are near identical between the two. However, Urban areas reach MUCH higher values of SNAP users than nonurban.
+
+With the last two graphs both showing similar results, I can safely conclude that Urban areas have a higher average SNAP count. I believe this is due to the fact that there is a denser population in urbanized areas, meaning a higher overall population, but I am unsure as tracts can vary in size. (Something extra to think about)
+
+# Prepping Data for Modeling
+
+Due to the absurd size of the data set I experienced a lot of trouble when trying to fit certain models. R repeatedly returned a Stack Overflow Error, and refused to run my data set as is. To fix this problem, I decided to stratify my data twice, effectively sub-setting it. For the first split I used a 60:40 ratio so that I can leave myself with a majority of the data to work with. In my head I believe this to be a sufficient first split, as this still leaves me with more than 30,000 observations to work with.
+
+For the second split I used a 75:25 ratio. I believe that this is the right choice since it allows my models to run to completion, and still leaves me with plenty of observations to work with. 
+
+I stratified on the variable `tract_snap` as this is the variable we are trying to calculate/predict: The number of SNAP users in a given census tract.
+```{r eval = FALSE, class.source = 'fold-show'}
+# Initial split to subset the data
+access_split1 <- access_clean %>%
+  initial_split(prop=0.6, strata = tract_snap)
+
+# Assign the 60% to a mock variable
+access_splitagain <- training(access_split1)
+
+# Split the mock variable and create our final testing and training set
+access_split2 <- access_splitagain %>%
+  initial_split(prop = 0.75, strata = tract_snap)
+access_train <- training(access_split2)
+access_test <- testing(access_split2)
+
+dim(access_train)
+dim(access_test)
+```
+
+After splitting twice, my training set contained roughly 23,400 observations, and my testing set had roughly 7,800 observations.
+
+## K-Fold Cross Validation
+
+The data involves recordings from every single Census region in the US, with multiple regions being contained by a county, thus there is a wide range of diverse populations leaving the data with a lot of room for variance. With such a large data set and so much room for error it would be smart to enlist the usage of stratified cross-validation resampling. This is useful in balancing my data into evenly split subgroups.
+
+Since `tract_snap` is the variable we are trying to predict, I stratified the data on it to allow for future models to resample efficiently and effectively, and to give them the best opportunity to develop an accurate model.
+
+**NOTE: When running my Random Forest model for the first time I noticed that County variables did not have enough of the same values to subset after splitting and folding, thus it was here where I realized it needed to be removed.**
+```{r eval = FALSE}
+# Default to 10 folds
+access_folds <- vfold_cv(access_train, v = 10, strata = tract_snap)
+```
+
+With my training and testing data ready it was time to construct the guidelines for my models: THE RECIPE
+
+## Recipe Building 
+
+Since my initial goal was to identify the best model for predicting our target variable, it was important that every model shared the same recipe. Keeping the variables constant would give each model a fighting chance at producing the most accurate model. My recipe for modeling contained all the essential variables like: `state`, `urban`, `numgqtrs`, `poverty_rate`, and `lasnap1`. I'd like to reiterate that although I would've liked to keep the variables addressing populations beyond 10 or 20 miles from a supermarket, there were too many NULL values to reasonably include it in my data set.  
+
+Detailed comments are in the code:
+```{r eval = FALSE, class.source = 'fold-show'}
+# Predict tract_snap with all of the predictors in the cleaned data set
+snap_recipe <- 
+  recipe(tract_snap ~ state + urban + pop2010 + numgqtrs + lila_tracts_1and10 + lila_tracts_1and20 + 
+           low_income_tracts + poverty_rate + median_family_income + la1and10 + la1and20 + la_tracts1 + 
+           la_tracts10 + la_tracts20 + lapop1 + lalowi1 + lawhite1 + lablack1 + laasian1 + lanhopi1 + laaian1 
+         + laomultir1 + lahisp1 + lasnap1, data = access_train) %>%
+  # Set all factors to dummy variables
+  step_dummy(all_nominal_predictors()) %>%
+  # Center and Scale all predictors using these two steps instead of step_normalize()
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+
+# Juice recipe and save
+cranberry <- juice(prep(snap_recipe))
+save(cranberry, file = "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/juice.rda")
+```
+
+Next I loaded the file containing the data provided by the `juice()` function. This function will tell me how high I can set my `mtry` parameter when I tune my models.
+```{r}
+# Load juiced information that was presaved
+# Presaved the juiced data as I wanted to show it, but couldn't 
+load("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/juice.rda")
+
+# Display juiced information
+cranberry
+```
+
+Juicing my recipe showed me that I can set my `mtry` at a maximum value of 74
+
+Since the original data set had 70,000+ observations and 150 variables, recreating my data each and every time I want to build/fit my models would take extremely long. For that reason, I saved my data to external R files so that I could load it in future steps. I set aside the data folds, the recipe, the training data, and the testing data.
+
+*Note: I usually use RDA files, but I was having trouble loading an RDA file with all of this data so I resorted to using RDS for this step only*
+```{r eval = FALSE, class.source = 'fold-show'}
+# Save all of the necessary components for future modeling and testing
+write_rds(access_folds, "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/k-folds.rds")
+write_rds(access_train, "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/train_data.rds")
+write_rds(access_test, "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/test_data.rds")
+write_rds(snap_recipe, "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/recipe.rds")
+```
+
+# Modeling
+
+Since this is ultimately a regression model I chose to run the following four models:  
+1. Random Forest  
+2. Nearest Neighbors  
+3. Boosted Trees  
+4. Linear Regression  
+
+The first three models are cross-fold validated models as I have a relatively large number of categorical variables alongside my numeric ones. I chose Linear Regression to be my last model, so that I could compare it to my cross-validated models.
+
+### Random Forest
+
+The first model is the Random Forest model. To create this model I set the mode to `regression` and used the `ranger` engine. Next I saved the model within the workflow, and listed `mtry` and `trees` as my respective tuning variables.
+```{r eval = FALSE, class.source = 'fold-show'}
+rf_model <- rand_forest() %>%
+  set_mode("regression") %>%
+  set_engine("ranger")
+
+rf_wf <- workflow() %>%
+  add_model(rf_model %>% set_args(mtry = tune(), trees = tune())) %>%
+  add_recipe(snap_recipe)
+```
+
+From here I established the tuning grid, setting `mtry` to a range of 1 to 74, choosing this range because of the returned information from `juice()`. The range for trees was set to 2 to 1000 to allow for adequate room for the model to work with. I set levels to 3, because although my computer had adequate computing power, I was afraid of more stack overflow errors, and want to make sure that the tuning succeeded the first time. 
+```{r eval = FALSE, class.source = 'fold-show'}
+# define grid
+rf_grid <- grid_regular(mtry(range = c(1,74)), trees(range = c(2,1000)), levels = 3)
+
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = access_folds,
+  grid = rf_grid
+)
+```
+The tuning process took anywhere from 3 to 4 hours to finish running. This is just a rough estimate because I left the room to snack. (Oops)
+
+
+Since the model took so long, I saved my model to an external RDA file so that I wouldn't have to wait for my model to run each and every time.
+```{r eval = FALSE, class.source = 'fold-show'}
+# Save residuals and workflows to save time
+save(rf_res, rf_wf, file = "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/rand_forest.rda")
+```
+
+*Note: When running my model for the first time I was notified of `county` factor variables missing from each of the folds of data. It was then that I realized that `county` doesn't have enough repetition in it to satisfy a 10-fold cross validation model, thus I decided to remove it here*
+
+### Nearest Neighbors
+
+My next model was the K-Nearest Neighbors Model. First, I loaded the regression model using the `kknn` engine and loaded the model into the workflow. I decided to only tune `neighbors` as I saw no reason to change any of the other parameters. Again I used a level of 3 to keep it consistent with my Random Forest model.
+```{r eval = FALSE, class.source = 'fold-show'}
+nn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+
+nn_wf <- workflow() %>%
+  add_model(nn_model) %>%
+  add_recipe(snap_recipe)
+
+nn_param <- parameters(nn_model)
+
+# define grid
+nn_grid <- grid_regular(nn_param, levels = 3)
+
+nn_res <- tune_grid(
+  nn_wf,
+  resamples = access_folds,
+  grid = nn_grid
+)
+```
+
+This model was a LOT faster. Finishing in about 20 to 50 minutes. Again, I didn't keep track as I was unsure of how long I would be aimlessly watching my code run. After it had finished I created another RDA file and saved it so that I could analyze it in the latter part of this project.
+```{r eval = FALSE, class.source = 'fold-show'}
+# Save residuals and workflows to save time
+save(nn_res, nn_wf, file = "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/knn.rda")
+```
+
+### Boosted Trees
+
+For the boosted trees model, I set the mode to `regression` and used the `xgboost` library to set the engine for this unique model. I then created a workflow and loaded the model and my recipe. Here I set the tuning arguments to `mtry` and `trees`. I chose to include trees after consulting Homework 6, and decided to keep `mtry` just in case. .
+```{r eval = FALSE, class.source = 'fold-show'}
+boost_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+boost_wf <- workflow() %>%
+  add_model(boost_model %>% set_args(mtry = tune(), trees = tune())) %>%
+  add_recipe(snap_recipe)
+```
+
+For my tuning grid, I set `mtry` to the usual 1 to 74, but gave trees a lot more room to work with. I decided to do this after running my random forest model and seeing that more trees netted a higher accuracy (to an extent. Again for consistency, I continued to use level 3 for my grid
+```{r eval = FALSE}
+# define grid
+boost_grid <- grid_regular(mtry(range = c(1,74)), trees(range = c(10,2000)), levels = 3)
+
+boost_res <- tune_grid(
+  boost_wf,
+  resamples = access_folds,
+  grid = boost_grid
+)
+```
+
+This model was another long one, taking anywhere from 1 to 2 hours. Again, to avoid any need to rerun my model, I saved it to an external RDA file.
+```{r eval = FALSE, class.source = 'fold-show'}
+# Save residuals and workflows to save time
+save(boost_res, boost_wf, file = "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/boost.rda")
+```
+
+### Linear Regression
+
+I was unsure as to what I should choose for my fourth model. I had tried Lasso Regression just to test it out, but the amount of independent variables in my model left me with a very unsatisfactory fit. Thus I decided to go with the old trusty linear regression model. I simply defined my regression equation and my training set. I then saved it to an RDA file so that all of my models would be in the same place.
+```{r eval = FALSE, class.source = 'fold-show'}
+# Create a linear regression model
+lm_model <- lm(tract_snap ~ state + urban + pop2010 + numgqtrs + lila_tracts_1and10 + lila_tracts_1and20 +
+                 low_income_tracts + poverty_rate + median_family_income + la1and10 + la1and20 + la_tracts1 +
+                 la_tracts10 + la_tracts20 + lapop1 + lalowi1 + lawhite1 + lablack1 + laasian1 + lanhopi1 + laaian1
+               + laomultir1 + lahisp1 + lasnap1, data = access_train)
+
+# Save residuals and workflows to save time
+save(lm_model, file = "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/lin_reg.rda")
+```
+
+This model was extremely fast as there was no tuning, so I was very doubtful in regards to its accuracy.
+
+# Cross Validation Model Analysis
+
+Now that I had all my cross validation models properly tuned, It was time to compare the results. To begin, I loaded the results into R.
+```{r}
+# Load all of the previously saved data from tuning models
+load("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/rand_forest.rda")
+load("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/knn.rda")
+load("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/boost.rda")
+load("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Models/lin_reg.rda")
+```
+
+## Random Forest
+
+First I used the `autoplot()` function, setting the metric to `rmse` so that I could see how the model performed with different values for `trees` and `mtry` values.
+```{r class.source = 'fold-show'}
+autoplot(rf_res, metric = "rmse")
+```
+
+Thanks to the plot, I can see that `rmse` decreases as we use more and more predictors, but stops once we get to about 37 or so. This is interesting because my model had 74 juiced predictors to pick from, but seemed to only see improved performance until the halfway point. 
+
+When I look at the `trees`, I see that having more trees in this case made my model more accurate. Although I was hoping for better results, I believe this is good enough for now!
+
+*Note: I didn't readjust the value for trees here like I did in boosted trees because I saw that rmse was minimized at 1000 trees. After seeing that the 500 tree line and 1000 tree line overlapped, I decided it would be pointless to retune the model*
+```{r class.source = 'fold-show'}
+show_best(rf_res, metric = "rmse") %>% select(-.estimator, -.config)
+```
+
+To double check my results, I used the `show_best()` function to see what the smallest `rmse` value was. The lowest was 60, a strong ways away from the standard deviation of `tract_snap`. Although this may seem inaccurate, when considering the fact that this model is addressing entire counties or states, 60 isn't such a bad number. To my surprise, the best observation also uses 73 out of the 74 variables.
+
+*Standard Deviation of `tract_snap` is 170.22*
+
+## Nearest Neighbor Model
+
+Analyzing my nearest neighbor model took the same steps as my Random Forest. I began with the `autoplot()` function and set the metric to `rmse`.
+```{r class.source = 'fold-show'}
+autoplot(nn_res, metric = "rmse")
+```
+
+Looking at this plot, I could already tell it wasn't as accurate as my Random Forest model. The best model seemed to have landed around `neighbors = 8`, but the `rmse` value had me very disappointed.
+
+```{r class.source = 'fold-show'}
+show_best(nn_res, metric = "rmse") %>% select(-.estimator, -.config)
+```
+
+Consulting the `show_best()` function my fears regarding the K-Nearest Neighbors Model. The lowest mean was 91.1, a far shot away from my Random Forest. This value was achieved with `neighbors = 8` and was not sufficient enough to consider as my final model.
+
+## Boosted Tree Model
+
+To begin my Boosted Tree analysis, I began with the same steps.
+```{r class.source = 'fold-show'}
+autoplot(boost_res, metric = "rmse")
+```
+
+`autoplot()` showed me that the the best `mtry` value for this model was around 37, the same as my Random Forest. However, It seemed that this model had managed to outperform the other tree based model.
+```{r class.source = 'fold-show'}
+show_best(boost_res, metric = "rmse") %>% select(-.estimator, -.config)
+```
+
+To my surprise, `show_best()`showed me that my best Boosted Tree model used 73 predictors and 1005 `trees`. With a mean of 49.4, this easily beat out my previous models, becoming the model I would most likely use to test my testing set.
+
+## Linear Regression Model
+
+Unfortunately for the Linear Regression Model, I needed to manually calculate the RMSE, so I will not be repeating the same process of using `autoplot()` and then `show_best()`
+```{r class.source = 'fold-show'}
+# Manual calculation of RMSE
+sqrt(mean(lm_model$residuals^2))
+```
+
+The linear regression model, although not perfect, somehow managed to beat the nearest neighbor model. The `rmse` was incredibly high, eliminating this model for further consideration. However, this model's performance over KNN had me wondering if I had properly tuned my nearest neighbor model.
+
+In all I continued with the **Boosted Tree Model** as this model performed the best out of all 4.
+
+# Final Model Building
+
+To begin building my final model, I will create a workflow with `best` in the name as we will be modeling the best performing Boosted Tree model. To ensure I select the proper model from my boosted trees model, I will be using `select_best()` to automatically choose the best model for me.
+```{r class.source = 'fold-show'}
+boost_wf_best <- boost_wf %>%
+  finalize_workflow(select_best(boost_res, metric = "rmse"))
+```
+
+Before I begin I need to load in my training set from the RDS file I set aside earlier in the project
+```{r class.source = 'fold-show'}
+access_train <- read_rds("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/train_data.rds")
+```
+
+And now I can fit my training set to my best model.
+
+*For convenience, I saved the output to another RDA file.*
+```{r eval = FALSE,  class.source = 'fold-show'}
+boost_results <- fit(boost_wf_best, access_train)
+
+save(boost_results, file = "C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/Finalized_Train.rda")
+```
+
+
+
+# Analyzing the Test Set
+
+For the last phase, I will need to load my testing data and final model for predicting:
+```{r class.source = 'fold-show'}
+# Load the finalized model and testing data
+load("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/Finalized_Train.rda")
+access_test <- read_rds("C:/Users/Mason Wong/Desktop/Final Project/Final_Project/R_Scripts/Data_Storage/test_data.rds")
+
+# Set the metric to RMSE for regression model
+snap_metric <- metric_set(rmse)
+
+# Predict using the testing data and display its RMSE
+test_model <- predict(boost_results, new_data = access_test) %>%
+  bind_cols(access_test %>% select(tract_snap))
+
+test_model_state <- predict(boost_results, new_data = access_test) %>%
+  bind_cols(access_test %>% select(tract_snap, state))
+
+test_model %>%
+  snap_metric(truth = tract_snap, estimate = .pred)
+```
+
+My testing set has returned a `rmse` of 47.9, the best `rmse` value yet! This is about a 1.5 lower than my training `rmse`!!! Since the standard deviation of my model is 170.22, I am deciding to not think of this as a red flag, but I it is possible that I have a small sampling bias in my model.
+
+To further examine the model and possibly locate problems, I have decided to plot a scatter plot of the predicted `tract_snap` values versus the actual data. While doing this, I am filtering out comparisons that had a difference larger than double my `rmse` (95.8).
+```{r fig.dim = c(10, 10)}
+# Graph the predictions by state with scaled axis
+test_model_state %>%
+  mutate(difference = tract_snap-.pred,
+         difference = abs(difference)) %>%
+  filter(difference >= 95.8) %>%
+  ggplot(aes(x = tract_snap, y = .pred)) + 
+  geom_abline(lty = 2) + 
+  geom_point(alpha = 2) + 
+  coord_obs_pred() + 
+  facet_wrap(~state) + 
+  labs(title = "Testing Set Predictions vs Actual",
+       subtitle = "Greater than 95.78 Difference",
+       y = "Predicted SNAP Users",
+       x = "SNAP Users"
+  )
+```
+```{r}
+test_model_state %>% 
+  mutate(difference = tract_snap-.pred,
+         difference = abs(difference)) %>% 
+  filter(difference >= 95.8) %>% 
+  group_by(state) %>% 
+  count() %>% 
+  arrange(-n)
+```
+
+The top states in this list are seemingly the most populated ones: Texas, Florida, California, and New York. 
+![("USA States Population Map 2010")](C:/Users/Mason Wong/Desktop/Final Project/Final_Project/Images/pop_dens.png)
+
+## Checking My Predictions
+
+Just to double check my model, let's take a look at how my model addresses sample data from the data set.
+
+### 0 SNAP test
+
+First I'll give my model a test to see how it handles predicting a area with 0 actual SNAP users (Data pulled from the data set):
+```{r}
+# Set data
+snap_0 <- data.frame(
+  state = "California",
+  urban = "Yes",
+  pop2010 = 2937,
+  numgqtrs = 2,
+  lila_tracts_1and10 = "No",
+  lila_tracts_1and20 = "No",
+  low_income_tracts = "No",
+  poverty_rate = 3.574879,
+  median_family_income = 220486,
+  la1and10 = "Yes",
+  la1and20 = "Yes",
+  la_tracts1 = "Yes",
+  la_tracts10 = "No",
+  la_tracts20 = "No",
+  lapop1 = 1.710517e+03,
+  lalowi1 = 1.718780e+02,
+  lawhite1 = 1.246365e+03,
+  lablack1 = 1.001408e+02,
+  laasian1 = 2.661702e+02,
+  lanhopi1 = 2.431579813,
+  laaian1 = 3.387046e+00,
+  laomultir1 = 9.202224e+01,
+  lahisp1 = 7.181757e+01,
+  lasnap1 = 0.000000e+00
+)
+
+# Display predicted value for comparison
+predict(boost_results, snap_0)
+```
+
+SUCCESS! The model predicted 0.29 SNAP users which is essentially 0. My model failed the stupidity test I had set for it.
+
+### Positive SNAP Test
+
+Now I will test my data using a tract in Texas that had 165 reported users
+```{r}
+# Set data
+snap_1 <- data.frame(
+  state = "Texas",
+  urban = "No",
+  pop2010 = 4685,
+  numgqtrs = 49,
+  lila_tracts_1and10 = "No",
+  lila_tracts_1and20 = "No",
+  low_income_tracts = "No",
+  poverty_rate = 16.1934600,
+  median_family_income = 69750,
+  la1and10 = "Yes",
+  la1and20 = "No",
+  la_tracts1 = "No",
+  la_tracts10 = "Yes",
+  la_tracts20 = "No",
+  lapop1 = 3.479840e+03,
+  lalowi1 = 1082.0320119,
+  lawhite1 = 3048.9861808,
+  lablack1 = 2.691548e+02,
+  laasian1 = 15.29708324,
+  lanhopi1 = 0.000000e+00,
+  laaian1 = 9.0871580,
+  laomultir1 = 137.3149739,
+  lahisp1 = 188.1673751,
+  lasnap1 = 125.17970950
+)
+
+# Display predicted value for comparison
+predict(boost_results, snap_1)
+```
+
+The model came out with 168! Given the larger values, I would say this is still a success, and if the USDA uses this model they should always account for some range of standard error as this is trying to predict for the entire nation.
+
+### Urbanized Example
+
+Now to test the difference regarding `urban`, I will be predicting with the same data, but setting the value of `urban` to "Yes"
+```{r}
+# Set data
+snap_2 <- data.frame(
+  state = "Texas",
+  urban = "Yes",
+  pop2010 = 4685,
+  numgqtrs = 49,
+  lila_tracts_1and10 = "No",
+  lila_tracts_1and20 = "No",
+  low_income_tracts = "No",
+  poverty_rate = 16.1934600,
+  median_family_income = 69750,
+  la1and10 = "Yes",
+  la1and20 = "No",
+  la_tracts1 = "No",
+  la_tracts10 = "Yes",
+  la_tracts20 = "No",
+  lapop1 = 3.479840e+03,
+  lalowi1 = 1082.0320119,
+  lawhite1 = 3048.9861808,
+  lablack1 = 2.691548e+02,
+  laasian1 = 15.29708324,
+  lanhopi1 = 0.000000e+00,
+  laaian1 = 9.0871580,
+  laomultir1 = 137.3149739,
+  lahisp1 = 188.1673751,
+  lasnap1 = 125.17970950
+)
+
+# Display predicted value for comparison
+predict(boost_results, snap_2)
+```
+
+This time I got a value of 172, slightly higher than the nonurbanized prediction. It seems like the model has determined that urbanized areas have higher amounts of SNAP usage!
+
+# Conclusion
+
+The analysis provided in this project has made me aware of relationships between variables in this data set that I had not previously expected.
+
+My best model, provided above, gives a reasonable prediction as to how many individuals have SNAP in a given area. I am afraid that narrowing the `rmse` to an even lower number may require the addition of more variables that are not available in the data set. To better predict urbanized and nonurbanized areas, I believe that it would be best to construct completely separate models for each level in the categorical variable. As it stands, nonurbanized areas tend to have fewer supermarkets, making it harder to get to a food source as it may be ten or more miles away. Unfortunately, I was unable to include data points like the 10 and 20 mile measurements due to the sheer number of null values. I believe having a separate model for this variable would help improve accuracy drastically and we may see nonurbanized predictions become more accurate because of this. 
+
+After testing various models, the best model for my data was the boosted tree model. I believe the boosted tree model was able to outperform the other models due to the large size of the data set. Boosted tree models observe previous models and learn from their mistakes, producing a more accurate and successful model. It would seem as though the large data set gave the boosted tree model enough data and time to correct a majority of its mistakes, resulting in a model more accurate than even the random forest model. Despite the high accuracy of my model, I suspect that there is a small chance that there is some sampling bias. I cannot prove this for sure, but since my test metric was lower than my training metric I would have to believe that there is some way I could improve my model. I did attempt to remove `lasnap1`, but saw a huge increase in `rmse` because of this. For that reason, I kept this variable in.
+
+The model that performed the worst was my K-Nearest Neighbors model. I am unsure as to why, and would like to delve deeper into tweaking the parameters to try and obtain a better model in the future.
+
+As mentioned above the next step would be to create a models that can separately address urban and nonurbanized tracts. Given more time I would also like to test out different recipes for my models and see if there are any key variables out of the 122 remaining that I missed. I removed these variables based on my understanding of the variables, and since I am only human there is a chance that my intuition was flawed. It is for that reason, that I say I would like to sample different recipes. I think taking these measures could help me uncover ways to make my model as accurate as it could possibly be. 
+
+Overall, the USDA's census data provided a fun, yet frustrating, way to interact with machine learning and provided me the opportunity to assess a large data set in one cumulative project. In the end this project has had the wonderful outcome of being able to predict the amount of users that have SNAP in a given area, and could be used to predict the amount of users to have SNAP over a given year. Even if my predictions and models were slightly off, I inevitably enjoyed this experience and have a better viewpoint on machine learning because of it.
+
+![("Growing Tree Gif.")](C:/Users/Mason Wong/Desktop/Final Project/Final_Project/Images/boosted_tree.gif)
+
+
+# Data Citation
+USDA., 2021, Overview of food access indicators for low-income and other census tracts using different measures of food accessibility. USDA data release,          https://www.ers.usda.gov/data-products/food-access-research-atlas/download-the-data/
+
+*Data Citation can also be found within the Works Cited Document (All Photo and Youtube Citations Included)*
